@@ -6,3 +6,5 @@ edition = "2018"
 
 [dependencies]
 clap = "2.32.0"
+#futures = "0.1.25"
+futures-preview = "0.3.0-alpha.12"

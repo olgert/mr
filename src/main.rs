@@ -6,6 +6,8 @@ use std::time::Duration;
 use std::process::Command;
 use std::borrow::Cow;
 use std::time::Instant;
+use std::cmp;
+use std::process::ExitStatus;
 
 
 fn main() {
@@ -102,13 +104,48 @@ fn schedule(runtime: RuntimeOptions,
         let mut split = runtime.test_cmd.split_whitespace();
         let mut cmd = Command::new(split.next().expect("Can't parse test_cmd"));
         let start = Instant::now();
-        let res = cmd.args(split).spawn()
-            .expect("Command failed").wait_with_output()
-            .expect("Error while awaiting for test_cmd");
+        let mut child = cmd.args(split).spawn().expect("Command failed");
+        let mut delay = Duration::from_micros(500);
+        let max_wait_step = Duration::from_millis(500);
+        let interval = Duration::from_secs(runtime.interval as u64);
+        let terminate_at = start + interval;
+        let mut exit_code = None;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    println!("exited with: {}", status);
+                    exit_code = Some(status.code().expect("error getting exit code"));
+                    break;
+                },
+                Ok(None) => {
+                    if Instant::now() > terminate_at {
+                        let result = child.kill();
+                        println!("Attempted to kill the monitor: {:?}", result);
+                        result.expect("Error killing the monitor");
+                        exit_code = Some(128 + 9);
+                        break;
+                    }
+                    delay *= 2;
+                    let remaining = interval - (Instant::now() - start);
+                    let sleep_for = cmp::min(cmp::min(delay, max_wait_step), remaining);
+                    println!("waiting for {}ms ...", sleep_for.as_millis());
+                    thread::sleep(sleep_for);
+                }
+                Err(e) => {
+                    println!("error attempting to wait: {}", e);
+                    break;
+                },
+            }
+        }
         let duration = Instant::now() - start;
         println!("Run took {}ms", duration.as_millis());
-        println!("{:?}", res);
-        thread::sleep(Duration::from_secs(runtime.interval as u64) - duration);
+        println!("Status: {:?}", exit_code);
+        println!("cm,app={},name={},ret_code={} value=1,duration={},interval={},routing_key={},artifact_url={},image_url={}",
+                 runtime.app_name, runtime.name, exit_code.expect("Exit code was not detected"),
+                 duration.as_millis(), runtime.interval, routing_key, "<artifact_url>", "<image_url>");
+        if interval > duration {
+            thread::sleep(interval - duration);
+        }
     }
 
 }
@@ -124,14 +161,10 @@ impl<'a> fmt::Display for RuntimeOptions<'a> {
     }
 }
 
-//impl<'a> RuntimeOptions<'a> {
-//    fn get_command(&'a self) -> () {
-//        let mut split = self.test_cmd.split_whitespace();
-//        let headsplit.next();
-//        let res = cmd.args(split);
-//        Cow::Owned(res)
-//    }
-//}
+struct RunResult {
+    exit_code: u8,
+    duration: Duration,
+}
 
 struct RuntimeOptions<'a> {
     app_name: &'a str,
