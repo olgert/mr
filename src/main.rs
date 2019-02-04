@@ -96,18 +96,22 @@ fn schedule(runtime: RuntimeOptions,
             influxdb: InfluxDBOptions,
             artifacts: ArtifactsOptions,
             routing_key: &str) {
+    let interval = Duration::from_secs(runtime.interval as u64);
+    let timeout = Duration::from_secs(runtime.timeout as u64);
+    if timeout > interval {
+        panic!("Timeout has to be less than Interval")
+    }
+    let max_wait_step = Duration::from_millis(500);
+
+    println!("Runtime options: {}", runtime);
 
     loop {
-        println!("Runtime options: {}", runtime);
-
+        let start = Instant::now();
+        let terminate_at = start + timeout;
         let mut split = runtime.test_cmd.split_whitespace();
         let mut cmd = Command::new(split.next().expect("Can't parse test_cmd"));
-        let start = Instant::now();
         let mut child = cmd.args(split).spawn().expect("Command failed");
         let mut delay = Duration::from_micros(500);
-        let max_wait_step = Duration::from_millis(500);
-        let interval = Duration::from_secs(runtime.interval as u64);
-        let terminate_at = start + interval;
         let mut exit_code = None;
         loop {
             match child.try_wait() {
