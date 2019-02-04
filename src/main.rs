@@ -1,5 +1,4 @@
 use clap::Arg;
-use core::fmt::Debug;
 use std::fmt;
 use std::thread;
 use std::time::Duration;
@@ -114,7 +113,7 @@ fn schedule(runtime: RuntimeOptions,
             match child.try_wait() {
                 Ok(Some(status)) => {
                     println!("exited with: {}", status);
-                    exit_code = Some(status.code().expect("error getting exit code"));
+                    exit_code = status.code();
                     break;
                 },
                 Ok(None) => {
@@ -141,7 +140,7 @@ fn schedule(runtime: RuntimeOptions,
         println!("Run took {}ms", duration.as_millis());
         println!("Status: {:?}", exit_code);
         println!("cm,app={},name={},ret_code={} value=1,duration={},interval={},routing_key={},artifact_url={},image_url={}",
-                 runtime.app_name, runtime.name, exit_code.expect("Exit code was not detected"),
+                 runtime.app_name, runtime.name, exit_code.unwrap_or(-1),
                  duration.as_millis(), runtime.interval, routing_key, "<artifact_url>", "<image_url>");
         if interval > duration {
             thread::sleep(interval - duration);
