@@ -1,12 +1,14 @@
-use clap::Arg;
 use std::fmt;
 use std::thread;
 use std::time::Duration;
 use std::process::Command;
-use std::borrow::Cow;
 use std::time::Instant;
-use std::cmp;
-use std::process::ExitStatus;
+use clap::Arg;
+use nix;
+use nix::sys::signal;
+use nix::unistd::Pid;
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus::StillAlive};
+use nix::sys::signal::kill;
 
 
 fn main() {
@@ -29,6 +31,9 @@ fn main() {
         .arg(Arg::with_name("timeout").takes_value(true)
             .long("timeout").env("MONITOR_TIMEOUT").default_value("5")
             .help("Number of seconds to wait before killing test run"))
+        .arg(Arg::with_name("influxdb-measurement").takes_value(true)
+            .long("influxdb-measurement").env("MONITOR_INFLUXDB_MEASUREMENT").default_value("cm")
+            .help("InfluxDB measurement name to write"))
         .arg(Arg::with_name("influxdb-host").takes_value(true)
             .long("influxdb-host").env("MONITOR_INFLUXDB_HOST")
             .help("InfluxDB host to send stats to"))
@@ -72,7 +77,8 @@ fn main() {
         interval: matches.value_of("interval").unwrap().parse().unwrap(),
         timeout: matches.value_of("timeout").unwrap().parse().unwrap(),
     };
-    let influxdb = InfluxDBOptions{
+    let influxdb = InfluxDBOptions {
+        measurement: matches.value_of("influxdb-measurement").unwrap(),
         host: matches.value_of("influxdb-host"),
         port: matches.value_of("influxdb-port"),
         username: matches.value_of("influxdb-username"),
@@ -80,7 +86,7 @@ fn main() {
         dbname: matches.value_of("influxdb-dbname"),
         rpname: matches.value_of("influxdb-rpname")
     };
-    let artifacts = ArtifactsOptions{
+    let artifacts = ArtifactsOptions {
         artifacts_glob: matches.value_of("artifacts-glob"),
         image_artifact: matches.value_of("image-artifact"),
         aws_access_key: matches.value_of("aws-access-key"),
@@ -101,50 +107,28 @@ fn schedule(runtime: RuntimeOptions,
     if timeout > interval {
         panic!("Timeout has to be less than Interval")
     }
-    let max_wait_step = Duration::from_millis(500);
 
     println!("Runtime options: {}", runtime);
+    println!("InfluxDB options: {}", influxdb);
+    println!("Artifacts options: {}", artifacts);
 
     loop {
         let start = Instant::now();
-        let terminate_at = start + timeout;
         let mut split = runtime.test_cmd.split_whitespace();
         let mut cmd = Command::new(split.next().expect("Can't parse test_cmd"));
         let mut child = cmd.args(split).spawn().expect("Command failed");
-        let mut delay = Duration::from_micros(500);
-        let mut exit_code = None;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    println!("exited with: {}", status);
-                    exit_code = status.code();
-                    break;
-                },
-                Ok(None) => {
-                    if Instant::now() > terminate_at {
-                        let result = child.kill();
-                        println!("Attempted to kill the monitor: {:?}", result);
-                        result.expect("Error killing the monitor");
-                        exit_code = Some(128 + 9);
-                        break;
-                    }
-                    delay *= 2;
-                    let remaining = interval - (Instant::now() - start);
-                    let sleep_for = cmp::min(cmp::min(delay, max_wait_step), remaining);
-                    println!("waiting for {}ms ...", sleep_for.as_millis());
-                    thread::sleep(sleep_for);
-                }
-                Err(e) => {
-                    println!("error attempting to wait: {}", e);
-                    break;
-                },
-            }
-        }
+        let child_pid = Pid::from_raw(child.id() as i32);
+        let spwn = thread::Builder::new()
+            .name("KillerThread".to_string())
+            .spawn(move || killer_routine(child_pid, timeout));
+
+        let result = child.wait();
+        let exit_code = result.expect("unable to get result").code();
         let duration = Instant::now() - start;
         println!("Run took {}ms", duration.as_millis());
         println!("Status: {:?}", exit_code);
-        println!("cm,app={},name={},ret_code={} value=1,duration={},interval={},routing_key={},artifact_url={},image_url={}",
-                 runtime.app_name, runtime.name, exit_code.unwrap_or(-1),
+        println!("{},app={},name={},ret_code={} value=1,duration={},interval={},routing_key={},artifact_url={},image_url={}",
+                 influxdb.measurement, runtime.app_name, runtime.name, exit_code.unwrap_or(-1),
                  duration.as_millis(), runtime.interval, routing_key, "<artifact_url>", "<image_url>");
         if interval > duration {
             thread::sleep(interval - duration);
@@ -153,14 +137,25 @@ fn schedule(runtime: RuntimeOptions,
 
 }
 
-impl<'a> fmt::Display for RuntimeOptions<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "({}/{}: {} every {}s for {}s)",
-               self.app_name,
-               self.name,
-               self.test_cmd,
-               self.interval,
-               self.timeout)
+fn killer_routine(pid: Pid, timeout: Duration) {
+    thread::sleep(timeout);
+    match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+        Ok(StillAlive) => {
+            match kill(pid, signal::SIGKILL) {
+                Ok(_) => {
+                    println!("Killed monitor by timeout. PID: {}", pid);
+                },
+                Err(e) => {
+                    println!("Error killing monitor by timeout. PID: {}, ERROR: {}", pid, e);
+                }
+            }
+        },
+        Ok(status) => {
+            println!("Monitor is in status ({:?})", status);
+        }
+        Err(e) => {
+            println!("Monitor is not running ({})", e);
+        }
     }
 }
 
@@ -177,7 +172,20 @@ struct RuntimeOptions<'a> {
     timeout: u32,
 }
 
+impl<'a> fmt::Display for RuntimeOptions<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Runtime[{}/{}: {} every {}s for {}s]",
+               self.app_name,
+               self.name,
+               self.test_cmd,
+               self.interval,
+               self.timeout,
+        )
+    }
+}
+
 struct InfluxDBOptions<'a> {
+    measurement: &'a str,
     host: Option<&'a str>,
     port: Option<&'a str>,
     username: Option<&'a str>,
@@ -186,9 +194,34 @@ struct InfluxDBOptions<'a> {
     rpname: Option<&'a str>,
 }
 
+impl<'a> fmt::Display for InfluxDBOptions<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "InfluxDB[({}) to http://{}:{}@{}:{}/write?db={}&rp={}]",
+               self.measurement,
+               self.username.and(Some("*****")).unwrap_or_default(),
+               self.password.and(Some("*****")).unwrap_or_default(),
+               self.host.unwrap_or_default(),
+               self.port.unwrap_or_default(),
+               self.dbname.unwrap_or_default(),
+               self.rpname.unwrap_or_default(),
+        )
+    }
+}
+
 struct ArtifactsOptions<'a> {
     artifacts_glob: Option<&'a str>,
     image_artifact: Option<&'a str>,
     aws_access_key: Option<&'a str>,
     aws_secret_access_key: Option<&'a str>,
+}
+
+impl<'a> fmt::Display for ArtifactsOptions<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Artifacts[{}/{} {}/{}]",
+               self.artifacts_glob.unwrap_or_default(),
+               self.image_artifact.unwrap_or_default(),
+               self.aws_access_key.unwrap_or_default(),
+               self.aws_secret_access_key.and(Some("*****")).unwrap_or_default(),
+        )
+    }
 }
